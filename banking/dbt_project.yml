@@ -1,0 +1,43 @@
+name: 'banking'
+version: '1.0.0'
+profile: 'banking'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Model configurations
+models:
+  banking:
+    # Staging layer: views in analytics_staging
+    staging:
+      +materialized: view
+      +schema: analytics_staging
+    
+    # Marts layer
+    marts:
+      # Dimension tables: tables in analytics
+      dimensions:
+        +materialized: table
+        +schema: analytics
+      
+      # Fact tables: incremental in analytics
+      facts:
+        +materialized: incremental
+        +schema: analytics
+        +on_schema_change: 'append_new_columns'
+
+# Snapshot configurations
+snapshots:
+  banking:
+    +target_schema: analytics
+    +strategy: check
+    +unique_key: id
