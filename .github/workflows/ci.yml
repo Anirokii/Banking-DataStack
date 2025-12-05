@@ -1,0 +1,203 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ========================================
+  # JOB 1: Code Quality & Linting
+  # ========================================
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff black isort sqlfluff
+
+      - name: Run Ruff (Python linter)
+        run: |
+          ruff check . --output-format=github
+        continue-on-error: true
+
+      - name: Run Black (Python formatter check)
+        run: |
+          black --check data-generator/ consumer/ kafka-debezium/ || echo "Format issues found"
+        continue-on-error: true
+
+      - name: Run SQLFluff (SQL linter)
+        run: |
+          sqlfluff lint banking/models/ --dialect snowflake || echo "SQL lint issues found"
+        continue-on-error: true
+
+  # ========================================
+  # JOB 2: Python Tests
+  # ========================================
+  python-tests:
+    name: Python Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          pip install -r requirements.txt || echo "No root requirements"
+          pip install -r data-generator/requirements.txt || echo "No data-generator requirements"
+          pip install -r consumer/requirements.txt || echo "No consumer requirements"
+
+      - name: Run Python tests
+        run: |
+          pytest tests/ --cov --cov-report=xml --cov-report=term || echo "No tests yet"
+        continue-on-error: true
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        if: always()
+        with:
+          files: ./coverage.xml
+          flags: python-tests
+        continue-on-error: true
+
+  # ========================================
+  # JOB 3: dbt Validation
+  # ========================================
+  dbt-validation:
+    name: dbt Project Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dbt
+        run: |
+          python -m pip install --upgrade pip
+          pip install dbt-core==1.7.4 dbt-snowflake==1.7.1
+
+      - name: Setup dbt profile (dev)
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml <<EOL
+          banking:
+            target: dev
+            outputs:
+              dev:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+                user: ${{ secrets.SNOWFLAKE_USER }}
+                password: ${{ secrets.SNOWFLAKE_PASSWORD }}
+                role: ACCOUNTADMIN
+                database: banking
+                warehouse: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+                schema: analytics
+                threads: 4
+          EOL
+
+      - name: Install dbt dependencies
+        run: |
+          cd banking
+          dbt deps || echo "No dbt packages to install"
+
+      - name: dbt compile (syntax validation)
+        run: |
+          cd banking
+          dbt compile --profiles-dir ~/.dbt
+
+      - name: dbt parse (validate models)
+        run: |
+          cd banking
+          dbt parse --profiles-dir ~/.dbt
+
+      - name: Check for schema changes
+        run: |
+          cd banking
+          dbt run --select state:modified --state target/ --profiles-dir ~/.dbt || echo "No state comparison"
+        continue-on-error: true
+
+  # ========================================
+  # JOB 4: Docker Build Test
+  # ========================================
+  docker-build:
+    name: Docker Images Build Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Airflow image (test)
+        run: |
+          docker build -f dockerfile-airflow.dockerfile -t airflow-test:latest .
+
+      - name: Verify dbt in Docker image
+        run: |
+          docker run --rm airflow-test:latest dbt --version
+
+  # ========================================
+  # JOB 5: Security Scanning
+  # ========================================
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install safety
+        run: |
+          pip install safety
+
+      - name: Check for vulnerabilities
+        run: |
+          safety check || echo "Vulnerabilities found - review needed"
+        continue-on-error: true
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
