@@ -2,132 +2,95 @@ name: CD Pipeline
 
 on:
   push:
-    branches: [main]  # Deploy only from main branch
-  workflow_dispatch:  # Allow manual trigger
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
-  # ========================================
-  # JOB 1: Build and Push Docker Images
-  # ========================================
+  # JOB 1: Build Docker image (and optionally push)
   build-images:
-    name: Build Docker Images
     runs-on: ubuntu-latest
+    outputs:
+      image-tag: banking-airflow:latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub (optional)
+      - name: Log in to Docker registry (only if creds provided)
         uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
+        if: ${{ secrets.DOCKER_USERNAME }}
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-        continue-on-error: true
 
       - name: Build Airflow image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./dockerfile-airflow.dockerfile
-          push: false
-          tags: banking-airflow:latest
+          push: ${{ secrets.DOCKER_USERNAME && secrets.DOCKER_PASSWORD != '' }}
+          tags: ${{ secrets.DOCKER_USERNAME && secrets.DOCKER_USERNAME != '' && format('{0}/banking-airflow:latest', secrets.DOCKER_USERNAME) || 'banking-airflow:latest' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ========================================
   # JOB 2: Deploy dbt to Production
-  # ========================================
   deploy-dbt:
-    name: Deploy dbt Models to Production
     runs-on: ubuntu-latest
     needs: [build-images]
     environment:
       name: production
       url: https://app.snowflake.com
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: 'pip'
+          cache: "pip"
 
-      - name: Install dbt
+      - name: Install dbt (production version)
         run: |
           python -m pip install --upgrade pip
-          pip install dbt-core==1.7.4 dbt-snowflake==1.7.1
+          pip install "dbt-core==1.10.15" "dbt-snowflake==1.10.3"
 
-      - name: Setup dbt profile (production)
+      - name: Setup dbt profile (prod) using secrets
         run: |
           mkdir -p ~/.dbt
           cat > ~/.dbt/profiles.yml <<EOL
-          banking:
-            target: prod
-            outputs:
-              prod:
-                type: snowflake
-                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-                user: ${{ secrets.SNOWFLAKE_USER }}
-                password: ${{ secrets.SNOWFLAKE_PASSWORD }}
-                role: ACCOUNTADMIN
-                database: banking
-                warehouse: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
-                schema: prod
-                threads: 4
-                client_session_keep_alive: true
-                query_tag: github_actions_prod
-          EOL
+banking:
+  target: prod
+  outputs:
+    prod:
+      type: snowflake
+      account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      user: ${{ secrets.SNOWFLAKE_USER }}
+      password: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      role: ACCOUNTADMIN
+      database: banking
+      warehouse: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
+      schema: prod
+      threads: 4
+      client_session_keep_alive: true
+      query_tag: github_actions_prod
+EOL
 
-      - name: Install dbt dependencies
+      - name: cd to dbt project and run dbt
         run: |
           cd banking
-          dbt deps || echo "No packages to install"
-
-      - name: dbt debug (test connection)
-        run: |
-          cd banking
+          dbt deps || true
           dbt debug --profiles-dir ~/.dbt
-
-      - name: dbt seed (load reference data)
-        run: |
-          cd banking
-          dbt seed --profiles-dir ~/.dbt --target prod
-        continue-on-error: true
-
-      - name: dbt run - staging models
-        run: |
-          cd banking
+          dbt seed --profiles-dir ~/.dbt --target prod || true
           dbt run --select staging --profiles-dir ~/.dbt --target prod
-
-      - name: dbt snapshot - SCD2 tables
-        run: |
-          cd banking
           dbt snapshot --profiles-dir ~/.dbt --target prod
-
-      - name: dbt run - dimension models
-        run: |
-          cd banking
           dbt run --select marts.dimensions --profiles-dir ~/.dbt --target prod
-
-      - name: dbt run - fact models
-        run: |
-          cd banking
           dbt run --select marts.facts --profiles-dir ~/.dbt --target prod
-
-      - name: dbt test - data quality tests
-        run: |
-          cd banking
           dbt test --profiles-dir ~/.dbt --target prod
-
-      - name: dbt docs generate
-        run: |
-          cd banking
-          dbt docs generate --profiles-dir ~/.dbt --target prod
 
       - name: Upload dbt artifacts
         uses: actions/upload-artifact@v4
@@ -140,37 +103,24 @@ jobs:
             banking/target/catalog.json
           retention-days: 30
 
-  # ========================================
-  # JOB 3: Deploy Infrastructure Changes
-  # ========================================
+  # JOB 3: Optional infra deploy/notify (manual or if commit message contains [infra])
   deploy-infrastructure:
-    name: Deploy Infrastructure Updates
     runs-on: ubuntu-latest
     needs: [build-images]
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[infra]')
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && contains(github.event.head_commit.message, '[infra]')) }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml (local check)
+        run: docker-compose -f docker-compose.yml config
+      - name: Notify infra change
+        run: echo "Infrastructure change detected. Review and apply manually."
 
-      - name: Validate docker-compose.yml
-        run: |
-          docker-compose config
-
-      - name: Create deployment notification
-        run: |
-          echo "Infrastructure changes detected"
-          echo "Review docker-compose.yml changes manually"
-
-  # ========================================
-  # JOB 4: Data Quality Validation
-  # ========================================
+  # JOB 4: Post deployment data quality checks
   data-quality-checks:
-    name: Post-Deployment Data Quality
     runs-on: ubuntu-latest
     needs: [deploy-dbt]
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -178,82 +128,41 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          pip install snowflake-connector-python pandas
+        run: python -m pip install --upgrade pip && pip install snowflake-connector-python pandas
 
-      - name: Run custom data quality checks
-        run: |
-          python -c "
-          import snowflake.connector
-          import os
-
-          conn = snowflake.connector.connect(
-              account=os.environ['SNOWFLAKE_ACCOUNT'],
-              user=os.environ['SNOWFLAKE_USER'],
-              password=os.environ['SNOWFLAKE_PASSWORD'],
-              warehouse=os.environ['SNOWFLAKE_WAREHOUSE'],
-              database='banking',
-              schema='prod'
-          )
-
-          cursor = conn.cursor()
-
-          # Check row counts
-          tables = ['dim_customers', 'dim_accounts', 'fact_transactions']
-          for table in tables:
-              cursor.execute(f'SELECT COUNT(*) FROM {table}')
-              count = cursor.fetchone()[0]
-              print(f'{table}: {count} rows')
-              if count == 0:
-                  print(f'WARNING: {table} is empty!')
-
-          cursor.close()
-          conn.close()
-          "
+      - name: Run simple data quality checks
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
-        continue-on-error: true
+        run: |
+          python - <<PY
+import os, snowflake.connector
+conn = snowflake.connector.connect(
+    account=os.environ['SNOWFLAKE_ACCOUNT'],
+    user=os.environ['SNOWFLAKE_USER'],
+    password=os.environ['SNOWFLAKE_PASSWORD'],
+    warehouse=os.environ['SNOWFLAKE_WAREHOUSE'],
+    database='banking',
+    schema='prod'
+)
+cur = conn.cursor()
+for t in ['dim_customers','dim_accounts','fact_transactions']:
+    cur.execute(f"select count(*) from {t}")
+    print(t, cur.fetchone()[0])
+cur.close(); conn.close()
+PY
 
-  # ========================================
-  # JOB 5: Notify Deployment Status
-  # ========================================
+  # JOB 5: Notify (summary)
   notify:
-    name: Send Deployment Notifications
     runs-on: ubuntu-latest
     needs: [deploy-dbt, data-quality-checks]
     if: always()
     steps:
-      - name: Create deployment summary
+      - name: Deployment summary
         run: |
           echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Author:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Jobs Status:" >> $GITHUB_STEP_SUMMARY
-          echo "- dbt Deployment: ${{ needs.deploy-dbt.result }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Data Quality: ${{ needs.data-quality-checks.result }}" >> $GITHUB_STEP_SUMMARY
-
-      - name: Send Slack notification (optional)
-        if: secrets.SLACK_WEBHOOK_URL != ''
-        run: |
-          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
-            -H 'Content-Type: application/json' \
-            -d '{
-              "text": "Banking MDS Deployment",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Banking Modern Data Stack - Deployment Complete*\n\nBranch: `${{ github.ref_name }}`\nStatus: ${{ job.status }}\nCommit: ${{ github.sha }}"
-                  }
-                }
-              ]
-            }'
-        continue-on-error: true
+          echo "- Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deployer: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
