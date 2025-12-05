@@ -3,30 +3,26 @@ import boto3
 import snowflake.connector
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.models import Variable
 from datetime import datetime, timedelta
 
-# -------- Configuration depuis Airflow Variables --------
-# NOTE: Ne PAS utiliser load_dotenv() dans les DAGs Airflow!
-# Les variables doivent être définies via l'UI Airflow ou variables d'environnement du conteneur
-
+# -------- Configuration depuis Variables d'Environnement --------
 def get_config():
-    """Get configuration from Airflow Variables or environment variables"""
+    """Get configuration from environment variables"""
     return {
         # MinIO Config
-        'MINIO_ENDPOINT': Variable.get("MINIO_ENDPOINT", default_var="http://minio:9000"),
-        'MINIO_ACCESS_KEY': Variable.get("MINIO_ACCESS_KEY", default_var="minioadmin"),
-        'MINIO_SECRET_KEY': Variable.get("MINIO_SECRET_KEY", default_var="minioadmin"),
-        'MINIO_BUCKET': Variable.get("MINIO_BUCKET", default_var="raw"),
-        'LOCAL_DIR': Variable.get("MINIO_LOCAL_DIR", default_var="/tmp/minio_downloads"),
+        'MINIO_ENDPOINT': os.getenv('MINIO_ENDPOINT', 'http://minio:9000'),
+        'MINIO_ACCESS_KEY': os.getenv('MINIO_ACCESS_KEY', 'minioadmin'),
+        'MINIO_SECRET_KEY': os.getenv('MINIO_SECRET_KEY', 'minioadmin'),
+        'MINIO_BUCKET': os.getenv('MINIO_BUCKET', 'raw'),
+        'LOCAL_DIR': os.getenv('MINIO_LOCAL_DIR', '/tmp/minio_downloads'),
         
         # Snowflake Config
-        'SNOWFLAKE_USER': Variable.get("SNOWFLAKE_USER", default_var="Dali"),
-        'SNOWFLAKE_PASSWORD': Variable.get("SNOWFLAKE_PASSWORD", default_var="Ihecdali11223344"),
-        'SNOWFLAKE_ACCOUNT': Variable.get("SNOWFLAKE_ACCOUNT", default_var="rg77196.eu-west-3.aws"),
-        'SNOWFLAKE_WAREHOUSE': Variable.get("SNOWFLAKE_WAREHOUSE", default_var="COMPUTE_WH"),
-        'SNOWFLAKE_DB': Variable.get("SNOWFLAKE_DB", default_var="banking"),
-        'SNOWFLAKE_SCHEMA': Variable.get("SNOWFLAKE_SCHEMA", default_var="raw"),
+        'SNOWFLAKE_USER': os.getenv('SNOWFLAKE_USER'),
+        'SNOWFLAKE_PASSWORD': os.getenv('SNOWFLAKE_PASSWORD'),
+        'SNOWFLAKE_ACCOUNT': os.getenv('SNOWFLAKE_ACCOUNT'),
+        'SNOWFLAKE_WAREHOUSE': os.getenv('SNOWFLAKE_WAREHOUSE', 'COMPUTE_WH'),
+        'SNOWFLAKE_DB': os.getenv('SNOWFLAKE_DB', 'banking'),
+        'SNOWFLAKE_SCHEMA': os.getenv('SNOWFLAKE_SCHEMA', 'raw'),
     }
 
 TABLES = ["customers", "accounts", "transactions"]
@@ -170,10 +166,26 @@ def load_to_snowflake(**kwargs):
                 PURGE = TRUE
                 """
                 result = cur.execute(copy_sql)
-                rows_loaded = result.fetchone()
+                
+                # Get load statistics
                 print(f"   ✅ Data loaded into {table}")
-                if rows_loaded:
-                    print(f"   📊 Rows loaded: {rows_loaded}")
+                
+                # Check how many rows were actually loaded
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                row_count = cur.fetchone()[0]
+                print(f"   📊 Total rows in table: {row_count}")
+                
+                # Show any errors from the load
+                cur.execute(f"""
+                    SELECT * FROM TABLE(VALIDATE({table}, JOB_ID => '_last'))
+                    WHERE ERROR IS NOT NULL
+                    LIMIT 5
+                """)
+                errors = cur.fetchall()
+                if errors:
+                    print(f"   ⚠️  Load warnings/errors:")
+                    for error in errors:
+                        print(f"      {error}")
                 
             except snowflake.connector.errors.ProgrammingError as e:
                 print(f"   ❌ Error loading {table}: {e}")
